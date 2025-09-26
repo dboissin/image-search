@@ -1,0 +1,10 @@
+[package]
+name = "image-search"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+candle-transformers = "0.9.1"
+hf-hub = "0.4.3"
+image = "0.25.8"
+tokenizers = "0.22.1"
