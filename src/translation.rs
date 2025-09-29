@@ -99,7 +99,7 @@ mod tests {
         assert!(res.is_ok());
         let caption = res.unwrap().caption.unwrap();
         println!("{}", &caption);
-        assert!(&caption.contains("boat"));
+        assert!(&caption.contains("bateaux"));
     }
 
 }

@@ -8,5 +8,5 @@ fn test_image_captionning() {
     let device = Device::cuda_if_available(0).unwrap();
     let mut indexer = ImageIndexer::new(&device).unwrap();
     let res = indexer.indexing(&[img]);
-    assert!(res.is_err());
+    assert!(res.is_ok());
 }

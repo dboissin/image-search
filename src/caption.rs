@@ -1,7 +1,7 @@
 
 use std::{marker::PhantomData};
 
-use candle_transformers::{generation::LogitsProcessor, models::{blip::Config, mimi::candle::{self, Device, Tensor}, quantized_blip::BlipForConditionalGeneration}, quantized_var_builder::VarBuilder};
+use candle_transformers::{generation::LogitsProcessor, models::{blip::Config, mimi::{candle::{self, DType, Device, Tensor}, candle_nn::VarBuilder}, blip::BlipForConditionalGeneration}};
 use hf_hub::api::sync::Api;
 use tokenizers::Tokenizer;
 
@@ -19,20 +19,19 @@ impl <'a> CaptionStep<'a> {
     const MAX_TOKENS_ITER: usize = 1000;
     const SEED: u64 = 42;
     const SHAPE: (usize, usize, usize) = (384, 384, 3);
-    const CHANNEL_NORMALIZATION_MEAN: &'static[f32] = &[0.48145466f32, 0.4578275, 0.40821073];
-    const CHANNEL_NORMALIZATION_STD_DEV: &'static[f32] = &[0.26862954f32, 0.261_302_6, 0.275_777_1];
+    const MODEL_ID: &'static str = "Salesforce/blip-image-captioning-large";
+    const CHANNEL_NORMALIZATION_MEAN: &'static[f32] = &[0.48145466, 0.4578275, 0.40821073];
+    const CHANNEL_NORMALIZATION_STD_DEV: &'static[f32] = &[0.26862954, 0.26130258, 0.27577711];
 
     pub(crate) fn new(device: &'a Device) -> Result<Self> {
         let api = Api::new()?;
-        let blip_id = "Salesforce/blip-image-captioning-large".to_string();
-        let tokenizer_file = api.model(blip_id).get("tokenizer.json")?;
+        let tokenizer_file = api.model(Self::MODEL_ID.to_string()).get("tokenizer.json")?;
         let tokenizer = Tokenizer::from_file(tokenizer_file)?;
         let config = Config::image_captioning_large();
 
-        let model_id = "lmz/candle-blip".to_string();
-        let model_file = api.model(model_id).get("blip-image-captioning-large-q4k.gguf")?;
+        let model_file = api.model(Self::MODEL_ID.to_string()).get("model.safetensors")?;
 
-        let vb = VarBuilder::from_gguf(model_file, device)?;
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&model_file], DType::F32, &device)? };
         let model = BlipForConditionalGeneration::new(&config, vb)?;
 
         Ok(Self { model, tokenizer, device })
@@ -96,7 +95,6 @@ mod tests {
         let device = Device::cuda_if_available(0).unwrap();
         let mut caption = CaptionStep::new(&device).unwrap();
         let res = caption.captioning(img_item);
-        assert!(res.is_ok());
         let caption = res.unwrap().caption.unwrap();
         assert!(&caption.contains("boat"));
     }
