@@ -9,6 +9,8 @@ candle-nn = { version = "0.9.1", features = ["cuda"] }
 candle-transformers = "0.9.1"
 hf-hub = "0.4.3"
 image = "0.25.8"
+opencv = "0.96.0"
 serde = "1.0.227"
 serde_json = "1.0.145"
+tempfile = "3.23.0"
 tokenizers = "0.22.1"
