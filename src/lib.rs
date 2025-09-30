@@ -6,7 +6,7 @@ use crate::{caption::CaptionStep, translation::TranslationStep};
 
 pub mod caption;
 pub mod translation;
-
+pub mod ocr;
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -14,11 +14,14 @@ trait State {}
 
 struct Pending;
 struct Captioned;
+
+struct TextChecked;
 struct Translated;
 struct Completed;
 
 impl State for Pending {}
 impl State for Captioned {}
+impl State for TextChecked {}
 impl State for Translated {}
 impl State for Completed {}
 
