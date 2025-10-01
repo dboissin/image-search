@@ -77,6 +77,7 @@ impl <'a> CaptionStep<'a> {
             path: image_item.path,
             caption: Some(caption),
             text_content: image_item.text_content,
+            text_language: image_item.text_language,
             _state: PhantomData
         })
     }

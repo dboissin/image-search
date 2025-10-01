@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use std::{collections::HashMap, marker::PhantomData, path::Path};
 
 use candle_transformers::{generation::LogitsProcessor, models::{mimi::{candle::{DType, Device, Tensor}, candle_nn::VarBuilder}, trocr::{self, TrOCRModel}, vit}};
 use hf_hub::api::sync::Api;
@@ -6,7 +6,7 @@ use tempfile::tempdir;
 use tokenizers::Tokenizer;
 use opencv::{core::*, imgcodecs, imgproc};
 
-use crate::{Captioned, ImageItem, Result, TextChecked};
+use crate::{Captioned, ImageItem, Result, TextChecked, TextLanguage};
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct Config {
@@ -14,10 +14,14 @@ struct Config {
     decoder: trocr::TrOCRConfig,
 }
 
-pub(crate) struct TextExtractionStep<'a> {
+struct ModelItem {
     config: Config,
     model: TrOCRModel,
     decoder: Tokenizer,
+}
+
+pub(crate) struct TextExtractionStep<'a> {
+    models: HashMap<TextLanguage, ModelItem>,
     device: &'a Device,
 }
 
@@ -25,7 +29,8 @@ impl <'a> TextExtractionStep<'a> {
 
     const MAX_TOKENS_ITER: usize = 1000;
     const SEED: u64 = 42;
-    const MODEL_ID: (&'static str, &'static str) = ("microsoft/trocr-base-handwritten",""); // agomberto/trocr-base-printed-fr",""); //("agomberto/trocr-large-handwritten-fr", "refs/pr/3");
+    const MODEL_ID: (&'static str, &'static str) = ("microsoft/trocr-base-handwritten","");
+    const FR_MODEL_ID: (&'static str, &'static str) = ("agomberto/trocr-large-handwritten-fr","");
     const TOKENIZER_ID: (&'static str, &'static str) = ("ToluClassics/candle-trocr-tokenizer", "tokenizer.json");
     const SHAPE: (usize, usize, usize) = (384, 384, 3);
     const CHANNEL_NORMALIZATION_MEAN: &'static[f32] = &[0.5, 0.5, 0.5];
@@ -54,7 +59,43 @@ impl <'a> TextExtractionStep<'a> {
 
     fn preprocess<P: AsRef<str>>(&self, p: P) -> Result<Vec<Tensor>> {
         let filename = std::path::Path::new(p.as_ref()).file_name().unwrap();
-        let img = opencv::imgcodecs::imread(p.as_ref(), imgcodecs::IMREAD_COLOR)?;
+        let orig = opencv::imgcodecs::imread(p.as_ref(), imgcodecs::IMREAD_COLOR)?;
+
+
+        // --- resize ---
+
+        let size = orig.size()?; // taille actuelle (width, height)
+
+        // Taille max
+        let max_width = 1024;
+        let max_height = 768;
+
+        let (width, height) = (size.width, size.height);
+
+        let mut img: Mat = orig.clone();
+
+        // Vérifie si l’image dépasse les limites
+        if width > max_width || height > max_height {
+            // On calcule un facteur d’échelle pour conserver le ratio
+            let scale_w = max_width as f64 / width as f64;
+            let scale_h = max_height as f64 / height as f64;
+            let scale = scale_w.min(scale_h);
+
+            let new_width = (width as f64 * scale).round() as i32;
+            let new_height = (height as f64 * scale).round() as i32;
+
+            imgproc::resize(
+                &orig,
+                &mut img,
+                Size::new(new_width, new_height),
+                0.0,
+                0.0,
+                imgproc::INTER_AREA, // bon pour la réduction
+            )?;
+        }
+
+        // --- fin resize ---
+
 
         let mut gray = Mat::default();
         imgproc::cvt_color(&img, &mut gray, imgproc::COLOR_BGR2GRAY, 0)?;
@@ -98,20 +139,21 @@ impl <'a> TextExtractionStep<'a> {
         imgproc::cvt_color(&img, &mut gray_deskewed, imgproc::COLOR_BGR2GRAY, 0)?;
 
         let mut blurred = Mat::default();
-        imgproc::gaussian_blur(&gray_deskewed, &mut blurred, Size::new(7, 7), 0.0, 0.0, opencv::core::BORDER_DEFAULT)?;
+        imgproc::gaussian_blur(&gray_deskewed, &mut blurred, Size::new(9, 9), 0.0, 0.0, opencv::core::BORDER_DEFAULT)?;
 
         let mut binary_deskewed = Mat::default();
+        // imgproc::adaptive_threshold(&gray_deskewed, &mut binary_deskewed, 255.0,imgproc::ADAPTIVE_THRESH_MEAN_C, imgproc::THRESH_BINARY_INV, 15, 10.0)?;
         imgproc::threshold(&blurred, &mut binary_deskewed, 0.0, 255.0, imgproc::THRESH_BINARY_INV | imgproc::THRESH_OTSU)?;
 
         // imgcodecs::imwrite(&format!("{}-binary2.jpg", p.as_ref()), &binary2, &Vector::default())?;
 
         let kernel = imgproc::get_structuring_element(
-            imgproc::MORPH_RECT, Size::new(50, 1), Point::new(-1, -1))?;
+            imgproc::MORPH_RECT, Size::new(40, 2), Point::new(-1, -1))?;
         let mut dilated = Mat::default();
         imgproc::dilate(&binary_deskewed, &mut dilated, &kernel, Point::new(-1, -1), 5,
             opencv::core::BORDER_CONSTANT, imgproc::morphology_default_border_value()?)?;
 
-        // imgcodecs::imwrite(&format!("{}-kernel.jpg", p.as_ref()), &dilated, &Vector::default())?;
+        // imgcodecs::imwrite(&format!("dataset/kernel-{}", &filename.display()), &dilated, &Vector::default())?;
 
         let mut contours = Vector::<Mat>::default();
         imgproc::find_contours(
@@ -129,7 +171,7 @@ impl <'a> TextExtractionStep<'a> {
             let filename = format!("{}/{:03}-{}", &tmp_dir.path().display(), i, &filename.display());
             println!("{filename}");
             // TODO check rotation on single line
-            imgcodecs::imwrite(&filename.as_ref(), &roi, &Vector::default())?;
+            imgcodecs::imwrite(&filename, &roi, &Vector::default())?;
             normalized_images.push(self.load_image(filename)?);
         }
         //Ok(Tensor::stack(&normalized_images, 0)?)
@@ -137,56 +179,84 @@ impl <'a> TextExtractionStep<'a> {
     }
 
     pub(crate) fn new(device: &'a Device) -> Result<Self> {
+        let mut models = HashMap::new();
         let api = Api::new()?;
+
         let config_file = api.model(Self::MODEL_ID.0.to_string()).get("config.json")?;
-        // let config_file = api.repo(hf_hub::Repo::with_revision(
-        //     Self::MODEL_ID.0.to_string(), hf_hub::RepoType::Model,Self::MODEL_ID.1.to_string()))
-        //     .get("config.json")?;
         let config: Config = serde_json::from_reader(std::fs::File::open(config_file)?)?;
-        let model_file = api.model(Self::MODEL_ID.0.to_string()).get("model.safetensors")?;
-        // let model_file = api.repo(hf_hub::Repo::with_revision(
-        //     Self::MODEL_ID.0.to_string(), hf_hub::RepoType::Model,Self::MODEL_ID.1.to_string()))
-        //     .get("model.safetensors")?;
-        // let tokenizer_decode_file = api.model(Self::MODEL_ID.0.to_string()).get("tokenizer.json")?;
+
         let tokenizer_decode_file = api.model(Self::TOKENIZER_ID.0.to_string()).get(Self::TOKENIZER_ID.1)?;
         let decoder = Tokenizer::from_file(tokenizer_decode_file)?;
 
+        let model_file = api.model(Self::MODEL_ID.0.to_string()).get("model.safetensors")?;
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&model_file], DType::F32, &device)? };
         let model = TrOCRModel::new(&config.encoder, &config.decoder, vb)?;
 
-        Ok(Self { config, model, decoder, device })
+        models.insert(TextLanguage::EN, ModelItem { config, model, decoder});
+
+        let base_path = Path::new("/home/dboissin/ia/models/trocr-fr");
+        let config_file = base_path.join("config.json");
+        let config: Config = serde_json::from_reader(std::fs::File::open(config_file)?)?;
+
+        let tokenizer_decode_file = base_path.join("tokenizer.json");
+        let decoder = Tokenizer::from_file(tokenizer_decode_file)?;
+
+        let model_file = base_path.join("model.safetensors");
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&model_file], DType::F32, &device)? };
+        let model = TrOCRModel::new(&config.encoder, &config.decoder, vb)?;
+
+        models.insert(TextLanguage::FR, ModelItem { config, model, decoder});
+
+        Ok(Self { models, device })
     }
 
     pub(crate) fn read_text(&mut self, image_item: crate::ImageItem<Captioned>) -> Result<crate::ImageItem<TextChecked>> {
         let normalized_images = self.preprocess(&image_item.path)?;
+
+        let model_option = image_item.text_language.as_ref().map(|language| self.models.get_mut(language)).flatten();
+        if model_option.is_none() {
+            println!("No language defined or language not supported. Skip OCR.");
+            return Ok(ImageItem {
+                path: image_item.path,
+                caption: image_item.caption,
+                text_content: image_item.text_content,
+                text_language: image_item.text_language,
+                _state: PhantomData
+            })
+        }
+        let model_item = model_option.unwrap();
+        let model = &mut model_item.model;
+        let config = &model_item.config;
+        let decoder = &model_item.decoder;
+
         let mut result_text = vec![];
         for image in &normalized_images {
-            self.model.reset_kv_cache();
+            model.reset_kv_cache();
 
             let mut logits_processor = LogitsProcessor::new(Self::SEED, None, None);
             // let image = self.load_image(&image_item.path)?.unsqueeze(0)?.to_device(self.device)?;
             let image = image.unsqueeze(0)?.to_device(self.device)?;
-            let encoder_xs = self.model.encoder().forward(&image)?;
+            let encoder_xs = model.encoder().forward(&image)?;
 
-            let mut token_ids: Vec<u32> = vec![self.config.decoder.decoder_start_token_id];
+            let mut token_ids: Vec<u32> = vec![config.decoder.decoder_start_token_id];
             for index in 0..Self::MAX_TOKENS_ITER {
                 let context_size = if index >= 1 { 1 } else { token_ids.len() };
                 let start_pos = token_ids.len().saturating_sub(context_size);
                 let input_ids = Tensor::new(&token_ids[start_pos..], &self.device)?.unsqueeze(0)?;
 
-                let logits = self.model.decode(&input_ids, &encoder_xs, start_pos)?;
+                let logits = model.decode(&input_ids, &encoder_xs, start_pos)?;
 
                 let logits = logits.squeeze(0)?;
                 let logits = logits.get(logits.dim(0)? - 1)?;
                 let token = logits_processor.sample(&logits)?;
                 token_ids.push(token);
 
-                if token == self.config.decoder.eos_token_id {
+                if token == config.decoder.eos_token_id {
                     break;
                 }
             }
 
-            let text = self.decoder.decode(&token_ids, true)?;
+            let text = decoder.decode(&token_ids, true)?;
             println!("text : {}", &text);
             result_text.push(text);
         }
@@ -195,6 +265,7 @@ impl <'a> TextExtractionStep<'a> {
             path: image_item.path,
             caption: image_item.caption,
             text_content: Some(result_text.join("\n")),
+            text_language: image_item.text_language,
             _state: PhantomData
         })
     }
@@ -215,6 +286,7 @@ mod tests {
             path: "dataset/line-handwritten-text-en.jpg".to_string(),
             caption: None,
             text_content: None,
+            text_language: Some(TextLanguage::EN),
             _state: PhantomData
         };
         let device = Device::cuda_if_available(0).unwrap();
@@ -231,6 +303,7 @@ mod tests {
             path: "dataset/handwritten-text-en.jpg".to_string(),
             caption: None,
             text_content: None,
+            text_language: Some(TextLanguage::EN),
             _state: PhantomData
         };
         let device = Device::cuda_if_available(0).unwrap();
@@ -247,6 +320,7 @@ mod tests {
             path: "dataset/20250930_221248.jpg".to_string(),
             caption: None,
             text_content: None,
+            text_language: Some(TextLanguage::EN),
             _state: PhantomData
         };
         let device = Device::cuda_if_available(0).unwrap();
@@ -258,18 +332,36 @@ mod tests {
     }
 
     #[test]
-    fn test_single_line_handwritten_fr() {
+    fn test_multi_line_handwritten_fr() {
         let img_item = ImageItem {
             path: "dataset/20250926_171020.jpg".to_string(),
             caption: None,
             text_content: None,
+            text_language: Some(TextLanguage::FR),
             _state: PhantomData
         };
         let device = Device::cuda_if_available(0).unwrap();
         let mut ocr = TextExtractionStep::new(&device).unwrap();
         let res = ocr.read_text(img_item).unwrap();
         let text = res.text_content.unwrap();
-        assert!(&text.contains("boat"));
+        assert!(&text.contains("Auzon"));
+    }
+
+    #[test]
+    fn test_multi_lines_handwritten_fr_multi_colors() {
+        let img_item = ImageItem {
+            path: "dataset/20251001_094952.jpg".to_string(),
+            caption: None,
+            text_content: None,
+            text_language: Some(TextLanguage::FR),
+            _state: PhantomData
+        };
+        let device = Device::cuda_if_available(0).unwrap();
+        let mut ocr = TextExtractionStep::new(&device).unwrap();
+        let res = ocr.read_text(img_item).unwrap();
+        let text = res.text_content.unwrap();
+        println!("{text}");
+        assert!(&text.contains("en français"));
     }
 
     #[test]
@@ -278,6 +370,7 @@ mod tests {
             path: "dataset/handwritten-text-en.jpg".to_string(),
             caption: None,
             text_content: None,
+            text_language: Some(TextLanguage::EN),
             _state: PhantomData
         };
         let device = Device::cuda_if_available(0).unwrap();
@@ -292,6 +385,7 @@ mod tests {
             path: "dataset/20250926_171020.jpg".to_string(),
             caption: None,
             text_content: None,
+            text_language: Some(TextLanguage::FR),
             _state: PhantomData
         };
         let device = Device::cuda_if_available(0).unwrap();

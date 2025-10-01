@@ -25,17 +25,24 @@ impl State for TextChecked {}
 impl State for Translated {}
 impl State for Completed {}
 
+#[derive(Eq, Hash, PartialEq)]
+pub enum TextLanguage {
+    FR,
+    EN,
+}
+
 struct ImageItem<S: State> {
     path: String,
     caption: Option<String>,
     text_content: Option<String>,
+    text_language: Option<TextLanguage>,
     _state: PhantomData<S>
 }
 
 impl ImageItem<Pending> {
 
     pub fn new(image_path: &str) -> Self {
-        Self { path: image_path.to_string(), caption: None, text_content: None, _state: PhantomData }
+        Self { path: image_path.to_string(), caption: None, text_content: None, text_language: None, _state: PhantomData }
     }
 
 }

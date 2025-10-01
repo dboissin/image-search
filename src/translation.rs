@@ -71,6 +71,7 @@ impl <'a> TranslationStep<'a> {
             path: image_item.path,
             caption: Some(caption_fr),
             text_content: image_item.text_content,
+             text_language: None,
             _state: PhantomData
         })
     }
@@ -91,6 +92,7 @@ mod tests {
             path: "".to_string(),
             caption: Some("there are many boats docked at the dock on the water".to_string()),
             text_content: None,
+            text_language: None,
             _state: PhantomData
         };
         let device = Device::cuda_if_available(0).unwrap();
