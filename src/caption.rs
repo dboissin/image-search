@@ -1,16 +1,17 @@
 
 use std::{marker::PhantomData};
 
-use candle_transformers::{generation::LogitsProcessor, models::{blip::Config, mimi::{candle::{self, DType, Device, Tensor}, candle_nn::VarBuilder}, blip::BlipForConditionalGeneration}};
+use candle_transformers::{generation::LogitsProcessor, models::{blip::Config, mimi::{candle::{DType, Device, Tensor}, candle_nn::VarBuilder}, blip::BlipForConditionalGeneration}};
 use hf_hub::api::sync::Api;
 use tokenizers::Tokenizer;
 
-use crate::{Captioned, ImageItem, Pending, Result};
+use crate::{preprocessing::{self, ImageTensorConfig, ResizeStrategy}, Captioned, ImageItem, Pending, Result};
 
 pub(crate) struct CaptionStep<'a> {
     model: BlipForConditionalGeneration,
     tokenizer: Tokenizer,
     device: &'a Device,
+    img_config: ImageTensorConfig,
 }
 
 impl <'a> CaptionStep<'a> {
@@ -18,10 +19,7 @@ impl <'a> CaptionStep<'a> {
     const SEP_TOKEN_ID: u32 = 102;
     const MAX_TOKENS_ITER: usize = 1000;
     const SEED: u64 = 42;
-    const SHAPE: (usize, usize, usize) = (384, 384, 3);
     const MODEL_ID: &'static str = "Salesforce/blip-image-captioning-large";
-    const CHANNEL_NORMALIZATION_MEAN: &'static[f32] = &[0.48145466, 0.4578275, 0.40821073];
-    const CHANNEL_NORMALIZATION_STD_DEV: &'static[f32] = &[0.26862954, 0.26130258, 0.27577711];
 
     pub(crate) fn new(device: &'a Device) -> Result<Self> {
         let api = Api::new()?;
@@ -29,30 +27,23 @@ impl <'a> CaptionStep<'a> {
         let tokenizer = Tokenizer::from_file(tokenizer_file)?;
         let config = Config::image_captioning_large();
 
+        let mut img_config = ImageTensorConfig::default();
+        img_config.resize_strategy = ResizeStrategy::Pad;
+        img_config.normalization_mean =  vec![0.48145466, 0.4578275, 0.40821073];
+        img_config.normalization_std_dev = vec![0.26862954, 0.26130258, 0.27577711];
+        img_config.resample = 3;
+
         let model_file = api.model(Self::MODEL_ID.to_string()).get("model.safetensors")?;
 
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&model_file], DType::F32, &device)? };
         let model = BlipForConditionalGeneration::new(&config, vb)?;
 
-        Ok(Self { model, tokenizer, device })
-    }
-
-    fn load_image<P: AsRef<std::path::Path>>(&self, p: P) -> Result<Tensor> {
-        let img = image::ImageReader::open(p)?
-            .decode()?
-            .resize_to_fill(Self::SHAPE.0 as u32, Self::SHAPE.1 as u32, image::imageops::FilterType::Triangle);
-        let img = img.to_rgb8();
-        let data = img.into_raw();
-        let data = Tensor::from_vec(data, Self::SHAPE, self.device)?.permute((2, 0, 1))?;
-        let mean = Tensor::new(Self::CHANNEL_NORMALIZATION_MEAN, self.device)?.reshape((3, 1, 1))?;
-        let std = Tensor::new(Self::CHANNEL_NORMALIZATION_STD_DEV, self.device)?.reshape((3, 1, 1))?;
-
-        Ok((data.to_dtype(candle::DType::F32)? / 255.)?.broadcast_sub(&mean)?.broadcast_div(&std)?)
+        Ok(Self { model, tokenizer, device, img_config })
     }
 
     pub(crate) fn captioning(&mut self, image_item: crate::ImageItem<Pending>) -> Result<crate::ImageItem<Captioned>> {
         self.model.reset_kv_cache();
-        let image = self.load_image(&image_item.path)?.to_device(self.device)?;
+        let image = preprocessing::load_image(&image_item.path, &self.img_config, self.device)?.to_device(self.device)?;
         let image_embeds = image.unsqueeze(0)?.apply(self.model.vision_model())?;
         let mut logits_processor = LogitsProcessor::new(CaptionStep::SEED, None, None);
 

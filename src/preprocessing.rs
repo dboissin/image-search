@@ -1,57 +1,60 @@
-use std::{ffi::OsStr, path::Path};
+use std::path::Path;
 
 use candle_core::{DType, Device, Tensor};
-use image::imageops::FilterType;
-use opencv::{boxed_ref::BoxedRef, core::{bitwise_not, find_non_zero, no_array, Mat, MatTraitConst, Point, Point2f, Scalar, Size, Vector, BORDER_CONSTANT, BORDER_DEFAULT, BORDER_REPLICATE}, imgcodecs::{imread, imwrite, IMREAD_COLOR}, imgproc::{bounding_rect, cvt_color, dilate, find_contours, gaussian_blur, get_rotation_matrix_2d, get_structuring_element, min_area_rect, morphology_default_border_value, resize, threshold, warp_affine, CHAIN_APPROX_SIMPLE, COLOR_BGR2GRAY, INTER_AREA, INTER_CUBIC, MORPH_RECT, RETR_EXTERNAL, THRESH_BINARY, THRESH_OTSU}, Error};
-use tempfile::tempdir;
+use opencv::{boxed_ref::BoxedRef, core::{bitwise_not, copy_make_border, find_non_zero, no_array, Mat, MatTraitConst, MatTraitConstManual, Point, Point2f, Scalar, Size, Vec3b, Vector, BORDER_CONSTANT, BORDER_DEFAULT, BORDER_REPLICATE}, imgcodecs::{imread, IMREAD_COLOR}, imgproc::{bounding_rect, cvt_color, dilate, find_contours, gaussian_blur, get_rotation_matrix_2d, get_structuring_element, min_area_rect, morphology_default_border_value, resize, threshold, warp_affine, CHAIN_APPROX_SIMPLE, COLOR_BGR2GRAY, INTER_CUBIC, INTER_LANCZOS4, INTER_LINEAR, INTER_NEAREST, MORPH_RECT, RETR_EXTERNAL, THRESH_BINARY, THRESH_OTSU}, Error};
+
+#[derive(PartialEq)]
+pub(crate) enum ResizeStrategy {
+    Exact,
+    Ratio,
+    Pad,
+}
 
 pub(crate) struct ImageTensorConfig {
-    pad: bool,
-    shape: (usize, usize, usize),
-    normalization_mean: Vec<f32>,
-    normalization_std_dev: Vec<f32>,
-    resample: u8,
-    rescale_factor: Option<f64>,
-    max_width: i32,
-    max_height: i32,
+    pub(crate) resize_strategy: ResizeStrategy,
+    pub(crate) shape: (usize, usize, usize),
+    pub(crate) normalization_mean: Vec<f32>,
+    pub(crate) normalization_std_dev: Vec<f32>,
+    pub(crate) resample: u8,
+    pub(crate) rescale_factor: Option<f64>,
 }
 
 impl Default for ImageTensorConfig {
     fn default() -> Self {
         Self {
-            pad: false,
+            resize_strategy: ResizeStrategy::Ratio,
             shape: (384, 384, 3),
             normalization_mean: vec![0.5, 0.5, 0.5],
             normalization_std_dev: vec![0.5, 0.5, 0.5],
             resample: 2,
             rescale_factor: Some(1.0/255.0),
-            max_width: 1024,
-            max_height: 768
         }
     }
 }
 
-fn resample_filter_type(resample: u8) -> FilterType {
+fn resample_interpolation(resample: u8) -> i32 {
     match resample {
-        0 => FilterType::Nearest,       // Pillow NEAREST
-        1 => FilterType::Lanczos3,      // Pillow LANCZOS (or ANTIALIAS)
-        2 => FilterType::Triangle,      // Pillow BILINEAR
-        3 => FilterType::CatmullRom,    // Pillow BICUBIC
+        0 => INTER_NEAREST,       // Pillow NEAREST
+        1 => INTER_LANCZOS4,      // Pillow LANCZOS (or ANTIALIAS)
+        2 => INTER_LINEAR,      // Pillow BILINEAR
+        3 => INTER_CUBIC,    // Pillow BICUBIC
         _ => {
-            FilterType::CatmullRom
+            INTER_CUBIC
         }
     }
 }
 
 pub(crate) fn load_image<P: AsRef<Path>>(p: P, config: &ImageTensorConfig, device: &Device) -> crate::Result<Tensor> {
-    let img = image::ImageReader::open(p)?.decode()?;
-    let img = if config.pad {
-        img.resize_to_fill(config.shape.0 as u32, config.shape.1 as u32, resample_filter_type(config.resample))
-    } else {
-        img.resize_exact(config.shape.0 as u32, config.shape.1 as u32, resample_filter_type(config.resample))
-    };
+    let img = imread(&format!("{}", p.as_ref().display()), IMREAD_COLOR)?;
+    normalize(&img.into(), config, device)
+}
 
-    let mut data = Tensor::from_vec(img.to_rgb8().into_raw(), config.shape, device)?.permute((2, 0, 1))?.to_dtype(DType::F32)?;
+fn normalize(img: &BoxedRef<Mat>, config: &ImageTensorConfig, device: &Device) -> crate::Result<Tensor> {
+    let resized = resize_image(img, config.shape.0 as i32, config.shape.1 as i32,
+        &config.resize_strategy, resample_interpolation(config.resample))?;
+
+    let bytes: Vec<u8> = resized.to_vec_2d::<Vec3b>().into_iter().flatten().flatten().flat_map(|pix| pix.0).collect();
+    let mut data = Tensor::from_vec(bytes, config.shape, device)?.permute((2, 0, 1))?.to_dtype(DType::F32)?;
     let mean = Tensor::new(config.normalization_mean.as_slice(), device)?.reshape((3, 1, 1))?;
     let std = Tensor::new(config.normalization_std_dev.as_slice(), device)?.reshape((3, 1, 1))?;
 
@@ -61,20 +64,44 @@ pub(crate) fn load_image<P: AsRef<Path>>(p: P, config: &ImageTensorConfig, devic
     Ok(data.broadcast_sub(&mean)?.broadcast_div(&std)?)
 }
 
-fn resize_if_needed<P: AsRef<Path>>(p: P, max_width: i32, max_height: i32) -> Result<Mat, Error> {
+fn resize_if_needed<P: AsRef<Path>>(p: P, max_width: i32, max_height: i32, strategy: &ResizeStrategy, interpolation: i32) -> Result<Mat, Error> {
     let img = imread(&format!("{}", p.as_ref().display()), IMREAD_COLOR)?;
     let size = img.size()?;
     if size.width > max_width || size.height > max_height {
-        let scale_w = max_width as f64 / size.width as f64;
-        let scale_h = max_height as f64 / size.height as f64;
-        let scale = scale_w.min(scale_h);
-        let width = (size.width as f64 * scale).round() as i32;
-        let height = (size.height as f64 * scale).round() as i32;
-        let mut resized = Mat::default();
-        resize(&img, &mut resized, Size::new(width, height), 0.0, 0.0, INTER_AREA)?;
-        Ok(resized)
+        resize_image(&img.into(), max_width, max_height, strategy, interpolation)
     } else {
         Ok(img)
+    }
+}
+
+fn resize_image(img: &BoxedRef<Mat>, width: i32, height: i32, resize_strategy: &ResizeStrategy, interpolation: i32) -> Result<Mat, Error> {
+    let mut resized = Mat::default();
+    match resize_strategy {
+        ResizeStrategy::Exact => {
+            resize(img, &mut resized, Size::new(width, height), 0.0, 0.0, interpolation)?;
+            Ok(resized)
+        },
+        ResizeStrategy::Ratio | ResizeStrategy::Pad => {
+            let size = img.size()?;
+            let scale_w = width as f64 / size.width as f64;
+            let scale_h = height as f64 / size.height as f64;
+            let scale = scale_w.min(scale_h);
+            let n_width = (size.width as f64 * scale).round() as i32;
+            let n_height = (size.height as f64 * scale).round() as i32;
+            resize(img, &mut resized, Size::new(n_width, n_height), 0.0, 0.0, interpolation)?;
+
+            if  ResizeStrategy::Pad == *resize_strategy {
+                let mut padded = Mat::default();
+                let top = (height - n_height) / 2;
+                let bottom = height - n_height - top;
+                let left = (width - n_width) / 2;
+                let right = width - n_width - left;
+                copy_make_border(&resized, &mut padded, top, bottom, left, right, BORDER_CONSTANT, Scalar::all(0.0))?;
+                Ok(padded)
+            } else {
+                Ok(resized)
+            }
+        }
     }
 }
 
@@ -137,15 +164,9 @@ fn separate_lines_area<F: FnMut(BoxedRef<Mat>) -> crate::Result<()>>(img: &Mat, 
 }
 
 fn text_to_lines_tensors<P: AsRef<Path>, F: FnMut(Tensor) -> crate::Result<()>>(p: P, config: &ImageTensorConfig, device: &Device, mut handler: F) -> crate::Result<usize> {
-    let img = resize_if_needed(&p, config.max_width, config.max_height)?;
-    let mut i = 0;
-    let tmp_dir = tempdir()?;
-    let filename = p.as_ref().file_name().unwrap_or(OsStr::new("line.jpg"));
+    let img = resize_if_needed(&p, 1024, 768, &ResizeStrategy::Ratio, INTER_CUBIC)?;
     separate_lines_area(&img, |area| {
-        let tmp_filename = format!("{}/{:03}-{}", &tmp_dir.path().display(), i, &filename.display());
-        i += 1;
-        imwrite(&tmp_filename, &area, &Vector::default())?;
-        handler(load_image(&tmp_filename, config, device)?)
+        handler(normalize(&area, config, device)?)
     })
 }
 
@@ -163,6 +184,8 @@ mod tests {
 
     use std::fs;
 
+    use opencv::imgcodecs::imwrite;
+
     use super::*;
 
     #[test]
@@ -170,7 +193,7 @@ mod tests {
         let files = vec!["handwritten-text-en.jpg","20250926_171020.jpg", "20250930_221248.jpg", "20251001_094952.jpg", "printed-text-fr.png", "2023-03-26_22-18-04_UTC.jpg"];
         fs::create_dir_all("tests/generated-images/").unwrap();
         for file in files {
-            let img = resize_if_needed(format!("dataset/{}", file), 1024, 768).unwrap();
+            let img = resize_if_needed(format!("dataset/{}", file), 1024, 768, &ResizeStrategy::Ratio, INTER_CUBIC).unwrap();
             let area = mask_lines_area(&img).unwrap();
             let res = imwrite(&format!("tests/generated-images/mask-{}", file), &area, &Vector::default());
             assert!(res.is_ok() && res.unwrap());
@@ -182,7 +205,7 @@ mod tests {
         let files = vec![("handwritten-text-en.jpg", 3), ("20250926_171020.jpg", 4), ("20251001_094952.jpg", 3), ("2023-03-26_22-18-04_UTC.jpg", 6)];
         fs::create_dir_all("tests/generated-images/").unwrap();
         for (file, nb_expected_area) in files {
-            let img = resize_if_needed(format!("dataset/{}", file), 1024, 768).unwrap();
+            let img = resize_if_needed(format!("dataset/{}", file), 1024, 768, &ResizeStrategy::Ratio, INTER_CUBIC).unwrap();
             let mut i = 0;
             let res = separate_lines_area(&img, |area| {
                 let tmp_filename = format!("tests/generated-images/line-{:03}-{}", i, &file);

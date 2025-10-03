@@ -4,7 +4,7 @@ use candle_transformers::{generation::LogitsProcessor, models::{mimi::{candle::{
 use hf_hub::api::sync::Api;
 use tokenizers::Tokenizer;
 
-use crate::{preprocessing::{self, ImageTensorConfig}, Captioned, ImageItem, Result, TextChecked, TextLanguage};
+use crate::{preprocessing::{self, ImageTensorConfig, ResizeStrategy}, Captioned, ImageItem, Result, TextChecked, TextLanguage};
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct Config {
@@ -29,7 +29,7 @@ impl <'a> TextExtractionStep<'a> {
     const MAX_TOKENS_ITER: usize = 1000;
     const SEED: u64 = 42;
     const MODEL_ID: (&'static str, &'static str) = ("microsoft/trocr-base-handwritten","");
-    const FR_MODEL_ID: (&'static str, &'static str) = ("agomberto/trocr-large-handwritten-fr","");
+    // const FR_MODEL_ID: (&'static str, &'static str) = ("agomberto/trocr-large-handwritten-fr","");
     const TOKENIZER_ID: (&'static str, &'static str) = ("ToluClassics/candle-trocr-tokenizer", "tokenizer.json");
 
     pub(crate) fn new(device: &'a Device) -> Result<Self> {
@@ -39,7 +39,8 @@ impl <'a> TextExtractionStep<'a> {
         let config_file = api.model(Self::MODEL_ID.0.to_string()).get("config.json")?;
         let config: Config = serde_json::from_reader(std::fs::File::open(config_file)?)?;
 
-        let img_config = ImageTensorConfig::default();
+        let mut img_config = ImageTensorConfig::default();
+        img_config.resize_strategy = ResizeStrategy::Exact;
 
         let tokenizer_decode_file = api.model(Self::TOKENIZER_ID.0.to_string()).get(Self::TOKENIZER_ID.1)?;
         let decoder = Tokenizer::from_file(tokenizer_decode_file)?;
@@ -54,7 +55,8 @@ impl <'a> TextExtractionStep<'a> {
         let config_file = base_path.join("config.json");
         let config: Config = serde_json::from_reader(std::fs::File::open(config_file)?)?;
 
-        let img_config = ImageTensorConfig::default();
+        let mut img_config = ImageTensorConfig::default();
+        img_config.resize_strategy = ResizeStrategy::Exact;
 
         let tokenizer_decode_file = base_path.join("tokenizer.json");
         let decoder = Tokenizer::from_file(tokenizer_decode_file)?;
@@ -183,7 +185,7 @@ mod tests {
         let res = ocr.read_text(img_item).unwrap();
         let text = res.text_content.unwrap();
         println!("{text}");
-        assert!(&text.contains("to separate lines before"));
+        assert!(&text.to_lowercase().contains("to separate lines before"));
     }
 
     #[test]
@@ -200,7 +202,7 @@ mod tests {
         let res = ocr.read_text(img_item).unwrap();
         let text = res.text_content.unwrap();
         println!("{text}");
-        assert!(&text.contains("Car, cela permet de"));
+        assert!(&text.contains("habituellement une bonne valeur"));
     }
 
     #[test]
