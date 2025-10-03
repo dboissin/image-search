@@ -7,6 +7,7 @@ use crate::{caption::CaptionStep, translation::TranslationStep};
 pub mod caption;
 pub mod translation;
 pub mod ocr;
+pub(crate) mod preprocessing;
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
